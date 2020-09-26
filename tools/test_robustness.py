@@ -9,14 +9,15 @@ import mmcv
 import torch
 import torch.distributed as dist
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
-from mmcv.runner import get_dist_info, init_dist, load_checkpoint
+from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
+                         wrap_fp16_model)
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 from robustness_eval import get_results
 
 from mmdet import datasets
 from mmdet.apis import set_random_seed
-from mmdet.core import eval_map, wrap_fp16_model
+from mmdet.core import encode_mask_results, eval_map
 from mmdet.datasets import build_dataloader, build_dataset
 from mmdet.models import build_detector
 
@@ -98,12 +99,17 @@ def single_gpu_test(model, data_loader, show=False):
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=not show, **data)
-        results.append(result)
 
         if show:
             model.module.show_result(data, result, dataset.img_norm_cfg)
 
-        batch_size = data['img'][0].size(0)
+        # encode mask results
+        if isinstance(result[0], tuple):
+            result = [(bbox_results, encode_mask_results(mask_results))
+                      for bbox_results, mask_results in result]
+        results.extend(result)
+
+        batch_size = len(result)
         for _ in range(batch_size):
             prog_bar.update()
     return results
@@ -119,10 +125,14 @@ def multi_gpu_test(model, data_loader, tmpdir=None):
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
-        results.append(result)
+            # encode mask results
+            if isinstance(result[0], tuple):
+                result = [(bbox_results, encode_mask_results(mask_results))
+                          for bbox_results, mask_results in result]
+        results.extend(result)
 
         if rank == 0:
-            batch_size = data['img'][0].size(0)
+            batch_size = len(result)
             for _ in range(batch_size * world_size):
                 prog_bar.update()
 
@@ -152,7 +162,7 @@ def collect_results(result_part, size, tmpdir=None):
     else:
         mmcv.mkdir_or_exist(tmpdir)
     # dump the part result to the dir
-    mmcv.dump(result_part, osp.join(tmpdir, 'part_{}.pkl'.format(rank)))
+    mmcv.dump(result_part, osp.join(tmpdir, f'part_{rank}.pkl'))
     dist.barrier()
     # collect all parts
     if rank != 0:
@@ -161,7 +171,7 @@ def collect_results(result_part, size, tmpdir=None):
         # load results of all parts from tmp dir
         part_list = []
         for i in range(world_size):
-            part_file = osp.join(tmpdir, 'part_{}.pkl'.format(i))
+            part_file = osp.join(tmpdir, f'part_{i}.pkl')
             part_list.append(mmcv.load(part_file))
         # sort the results
         ordered_results = []
@@ -256,6 +266,10 @@ def main():
         raise ValueError('The output file must be a pkl file.')
 
     cfg = mmcv.Config.fromfile(args.config)
+    # import modules from string list.
+    if cfg.get('custom_imports', None):
+        from mmcv.utils import import_modules_from_strings
+        import_modules_from_strings(**cfg['custom_imports'])
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
@@ -333,8 +347,7 @@ def main():
                 test_data_cfg['pipeline'].insert(1, corruption_trans)
 
             # print info
-            print('\nTesting {} at severity {}'.format(corruption,
-                                                       corruption_severity))
+            print(f'\nTesting {corruption} at severity {corruption_severity}')
 
             # build the dataloader
             # TODO: support multiple images per gpu
@@ -342,7 +355,7 @@ def main():
             dataset = build_dataset(test_data_cfg)
             data_loader = build_dataloader(
                 dataset,
-                imgs_per_gpu=1,
+                samples_per_gpu=1,
                 workers_per_gpu=args.workers,
                 dist=distributed,
                 shuffle=False)
@@ -396,8 +409,7 @@ def main():
                                 is supported for pascal voc')
                 else:
                     if eval_types:
-                        print('Starting evaluate {}'.format(
-                            ' and '.join(eval_types)))
+                        print(f'Starting evaluate {" and ".join(eval_types)}')
                         if eval_types == ['proposal_fast']:
                             result_file = args.out
                         else:
@@ -406,10 +418,10 @@ def main():
                                     outputs, args.out)
                             else:
                                 for name in outputs[0]:
-                                    print('\nEvaluating {}'.format(name))
+                                    print(f'\nEvaluating {name}')
                                     outputs_ = [out[name] for out in outputs]
                                     result_file = args.out
-                                    + '.{}'.format(name)
+                                    + f'.{name}'
                                     result_files = dataset.results2json(
                                         outputs_, result_file)
                         eval_results = coco_eval_with_return(
